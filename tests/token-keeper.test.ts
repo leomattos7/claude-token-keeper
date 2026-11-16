@@ -50,8 +50,9 @@ function world(on: any, clock: { now: () => number }, init: { files?: Record<str
     stores: [] as unknown[],
     argvs: [] as string[][],
     writes: [] as { script: string; tmp: string; file: string }[],
-    reply: init.reply ?? (() => okReply()),
+    reply: (init.reply ?? (() => okReply())) as () => unknown,
     failSave: false,
+    links: new Set<string>(),
     onLock: undefined as undefined | ((dir: string) => void),
     put(path: string, text: string) {
       files.set(path, { text, mtimeMs: clock.now() })
@@ -68,7 +69,7 @@ function world(on: any, clock: { now: () => number }, init: { files?: Record<str
   })
   on('fs.stat', ($: any, e: any) => {
     const f = files.get(e.path)
-    if (f) return { value: { kind: 'file', size: f.text.length, mtimeMs: f.mtimeMs, isLink: false } }
+    if (f) return { value: { kind: 'file', size: f.text.length, mtimeMs: f.mtimeMs, isLink: w.links.has(e.path) } }
     if (dirs.has(e.path)) return { value: { kind: 'dir', size: 0, mtimeMs: dirs.get(e.path), isLink: false } }
     return { deny: 'ENOENT' }
   })
@@ -84,6 +85,12 @@ function world(on: any, clock: { now: () => number }, init: { files?: Record<str
       return done(0)
     }
     if (cmd === 'rmdir') return done(dirs.delete(a) ? 0 : 1)
+    if (cmd === 'mv') {
+      if (!dirs.has(a)) return done(1)
+      dirs.set(script, dirs.get(a)!)
+      dirs.delete(a)
+      return done(0)
+    }
     if (cmd === 'sh') {
       if (w.failSave) return done(1)
       w.writes.push({ script, tmp, file })
@@ -92,9 +99,9 @@ function world(on: any, clock: { now: () => number }, init: { files?: Record<str
     }
     return { deny: `unexpected command ${cmd}` }
   })
-  on('http.fetch', ($: any, e: any) => {
+  on('http.fetch', async ($: any, e: any) => {
     w.requests.push({ url: e.url, init: e.init })
-    const reply = w.reply()
+    const reply = await w.reply()
     return reply === 'network' ? { deny: 'network down' } : { value: reply }
   })
   on('ui.toast', ($: any, e: any) => {
@@ -121,7 +128,10 @@ const status = async ($: any, args = '') => (await $.command.run({ command: 'tok
 
 const CRED = `${HOME}/.claude/.credentials.json`
 const LOCK = `${HOME}/.claude/.oauth_refresh.lock`
-const LEASE = `${HOME}/.local/state/claude-token-keeper/lease.json`
+// The lease file is named after the sorted account set (first 8 bytes of its SHA-256, hex): the default set is ~/.claude alone.
+const sha = async (text: string) =>
+  [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))).slice(0, 8)].map((b) => b.toString(16).padStart(2, '0')).join('')
+const leaseOf = async (dirs: string[]) => `${HOME}/.local/state/claude-token-keeper/lease-${await sha([...dirs].sort().join('\n'))}.json`
 
 test('a token outside the window is left alone; inside it, one request rotates it', async ($, on) => {
   const clock = mock.clock(on, { now: T0 })
@@ -180,6 +190,7 @@ test('other keys survive and the write is a 0600 temp file renamed over the orig
 test('only the lease holder refreshes, and an expired lease is taken over', async ($, on) => {
   const clock = mock.clock(on, { now: T0 })
   mock.env(on, { HOME })
+  const LEASE = await leaseOf([`${HOME}/.claude`])
   const lease = JSON.stringify({ holder: 'another-session', until: T0 + 5 * MIN })
   const w = world(on, clock, { files: { [CRED]: creds(T0 + 5 * MIN), [LEASE]: lease } })
 
@@ -210,8 +221,12 @@ test('a lock held by another process blocks, a stale one is taken, a refresh tha
   expect(await status($)).toContain('another process is refreshing')
 
   w.dirs.set(LOCK, T0 - 90_000) // its holder died: stale after 60 s
+  w.argvs.length = 0
   await clock.advance(10 * MIN)
   expect(w.requests.length).toBe(1)
+  const moved = w.argvs.findIndex((a) => a[0] === 'mv' && a[1] === LOCK && a[2]!.startsWith(`${LOCK}.stale-`))
+  expect(moved).toBeGreaterThan(-1) // renamed aside first ...
+  expect(w.argvs[moved + 1]).toEqual(['rmdir', w.argvs[moved]![2]]) // ... then that name is deleted, never the lock path itself
 
   // Someone else lands a fresh token between our first read and the lock.
   w.put(CRED, creds(T0 + 5 * MIN))
@@ -338,7 +353,7 @@ test('no token appears in a toast, a status line, the command output, the store 
   await start($) // refreshes: tokens move through the write
   await clock.settle()
   w.failSave = true
-  w.reply = () => ({ status: 401, ok: false, headers: {}, text: '{"error":"RT-old-secret"}' })
+  w.reply = () => ({ status: 401, ok: false, headers: {}, text: '{"error":"invalid_grant","error_description":"RT-old-secret"}' })
   await status($, 'now') // refused: toast
   w.reply = () => okReply()
   await status($, 'now') // save fails: toast
@@ -386,4 +401,181 @@ test('after /clear the checks go on; after the session ends they stop', async ($
   await end($, 'prompt_input_exit')
   await clock.advance(30 * MIN)
   expect(w.requests.length).toBe(1)
+})
+
+test('a reply without refresh_token keeps the old one; no scope is sent when the login has none', async ($, on) => {
+  const clock = mock.clock(on, { now: T0 })
+  mock.env(on, { HOME })
+  const w = world(on, clock, {
+    files: { [CRED]: creds(T0 + 5 * MIN, { scopes: [] }) },
+    reply: () => okReply({ refresh_token: undefined, scope: undefined, refresh_token_expires_in: undefined }),
+  })
+
+  await start($)
+  await clock.settle()
+  expect(w.requests.length).toBe(1)
+  expect(JSON.parse(w.requests[0]!.init.body)).toEqual({
+    grant_type: 'refresh_token',
+    refresh_token: 'RT-old-secret',
+    client_id: '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
+  })
+  expect(w.oauth(CRED)).toMatchObject({
+    accessToken: 'AT-new-secret',
+    refreshToken: 'RT-old-secret',
+    scopes: [],
+    refreshTokenExpiresAt: T0 + 25 * 86_400_000,
+  })
+})
+
+test('only invalid_grant marks a login as needing sign-in; other refusals are retried without a toast', async ($, on) => {
+  const clock = mock.clock(on, { now: T0 })
+  mock.env(on, { HOME })
+  const w = world(on, clock, {
+    files: { [CRED]: creds(T0 + 5 * MIN) },
+    reply: () => ({ status: 400, ok: false, headers: {}, text: '{"error":"invalid_scope"}' }),
+  })
+
+  await start($)
+  await clock.settle()
+  expect(w.toasts.length).toBe(0)
+  expect(await status($)).toContain('last error http 400')
+
+  w.reply = () => ({ status: 401, ok: false, headers: {}, text: 'not json' })
+  await clock.advance(10 * MIN)
+  expect(w.requests.length).toBe(2) // retried, not parked
+  expect(w.toasts.length).toBe(0)
+  expect(await status($)).toContain('last error http 401')
+
+  w.reply = () => ({ status: 400, ok: false, headers: {}, text: '{"error":"invalid_grant"}' })
+  await clock.advance(10 * MIN)
+  expect(w.toasts.length).toBe(1)
+})
+
+test('a login without a refresh token is skipped and reported', async ($, on) => {
+  const clock = mock.clock(on, { now: T0 })
+  mock.env(on, { HOME })
+  const w = world(on, clock, { files: { [CRED]: creds(T0 + 5 * MIN, { refreshToken: '' }) } })
+  const before = w.text(CRED)
+
+  await start($)
+  await clock.settle()
+  expect(w.requests.length).toBe(0)
+  expect(w.text(CRED)).toBe(before)
+  expect(await status($)).toContain('last error skipped (no refresh token)')
+})
+
+test('a symlinked credentials file is never rewritten', async ($, on) => {
+  const clock = mock.clock(on, { now: T0 })
+  mock.env(on, { HOME })
+  const w = world(on, clock, { files: { [CRED]: creds(T0 + 5 * MIN) } })
+  w.links.add(CRED)
+
+  await start($)
+  await clock.settle()
+  expect(w.requests.length).toBe(0)
+  expect(w.writes.length).toBe(0)
+  expect(await status($, 'now')).toContain('skipped (credentials file is a symlink)')
+  expect(w.requests.length).toBe(0)
+})
+
+test('copies of one login are handled once per tick', async ($, on) => {
+  const clock = mock.clock(on, { now: T0 })
+  mock.env(on, { HOME })
+  const w = world(on, clock, {
+    files: { [CRED]: creds(T0 + 5 * MIN), [`${HOME}/.claude-copy/.credentials.json`]: creds(T0 + 5 * MIN), [`${HOME}/.claude-other/.credentials.json`]: creds(T0 + 5 * MIN, { refreshToken: 'RT-other' }) },
+    entries: [
+      { name: '.claude-copy', kind: 'dir' },
+      { name: '.claude-other', kind: 'dir' },
+    ],
+  })
+
+  await start($)
+  await clock.settle()
+  expect(w.requests.map((r) => JSON.parse(r.init.body).refresh_token).sort()).toEqual(['RT-old-secret', 'RT-other'])
+  expect(await status($)).toContain(`${HOME}/.claude-copy: access token expires in`)
+  expect(await status($)).toContain(`last error same login as ${HOME}/.claude`)
+})
+
+test('a write that lands during the request is not overwritten when the login changed, and is kept when only another key changed', async ($, on) => {
+  const clock = mock.clock(on, { now: T0 })
+  mock.env(on, { HOME })
+  const w = world(on, clock, { files: { [CRED]: creds(T0 + 5 * MIN) } })
+
+  // Someone logs in again while our request is out: their file stays as it is.
+  const relogin = creds(T0 + 8 * 60 * MIN, { accessToken: 'AT-relogin', refreshToken: 'RT-relogin' })
+  w.reply = () => {
+    w.put(CRED, relogin)
+    return okReply()
+  }
+  await start($)
+  await clock.settle()
+  expect(w.requests.length).toBe(1)
+  expect(w.writes.length).toBe(0)
+  expect(w.text(CRED)).toBe(relogin)
+  expect(w.toasts.length).toBe(0)
+  expect(await status($)).toContain('credentials changed during the refresh; not saved')
+
+  // Another key changes (same refresh token): that change is kept and our tokens go on top of it.
+  w.put(CRED, creds(clock.now() + 5 * MIN))
+  w.reply = () => {
+    w.put(CRED, JSON.stringify({ ...JSON.parse(w.text(CRED)!), mcpOAuth: { server: { fresh: true } } }))
+    return okReply()
+  }
+  await clock.advance(10 * MIN)
+  expect(w.writes.length).toBe(1)
+  const saved = JSON.parse(w.text(CRED)!)
+  expect(saved.mcpOAuth).toEqual({ server: { fresh: true } })
+  expect(saved.claudeAiOauth.accessToken).toBe('AT-new-secret')
+})
+
+test('a hung request times out after 30 s, frees the lock and does not stall the next tick', async ($, on) => {
+  const clock = mock.clock(on, { now: T0 })
+  mock.env(on, { HOME })
+  const w = world(on, clock, { files: { [CRED]: creds(T0 + 5 * MIN) } })
+  w.reply = () => clock.sleep(60 * MIN).then(() => okReply()) // answers an hour late
+
+  await start($)
+  await clock.settle()
+  expect(w.dirs.has(LOCK)).toBe(true)
+  await clock.advance(30_000)
+  expect(w.dirs.has(LOCK)).toBe(false)
+  expect(await status($)).toContain('last error network error')
+  expect(w.oauth(CRED).accessToken).toBe('AT-old-secret')
+
+  w.reply = () => okReply()
+  await clock.advance(10 * MIN) // the tick flag was reset: this one runs
+  expect(w.requests.length).toBe(2)
+  expect(w.oauth(CRED).accessToken).toBe('AT-new-secret')
+})
+
+test('a lock that is no longer ours at the end is left alone', async ($, on) => {
+  const clock = mock.clock(on, { now: T0 })
+  mock.env(on, { HOME })
+  const w = world(on, clock, { files: { [CRED]: creds(T0 + 5 * MIN) } })
+  w.reply = () => {
+    w.dirs.set(LOCK, clock.now() + 7) // our lock went stale during the request and someone else took the path
+    return okReply()
+  }
+
+  await start($)
+  await clock.settle()
+  expect(w.requests.length).toBe(1)
+  expect(w.dirs.get(LOCK)).toBe(T0 + 7)
+  expect(w.argvs.filter((a) => a[0] === 'rmdir').length).toBe(0)
+})
+
+test('the lease belongs to a set of accounts: a lease held for another set does not block', { options: { accounts: '~/.claude' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: T0 })
+  mock.env(on, { HOME })
+  const other = await leaseOf([`${HOME}/.claude`, `${HOME}/.claude-pessoal`])
+  const own = await leaseOf([`${HOME}/.claude`])
+  expect(other).not.toBe(own)
+  const held = JSON.stringify({ holder: 'another-session', until: T0 + 20 * MIN })
+  const w = world(on, clock, { files: { [CRED]: creds(T0 + 5 * MIN), [other]: held } })
+
+  await start($)
+  await clock.settle()
+  expect(w.requests.length).toBe(1) // the other set's lease is not ours to wait for
+  expect(w.text(other)).toBe(held)
+  expect(JSON.parse(w.text(own)!).holder).not.toBe('another-session')
 })

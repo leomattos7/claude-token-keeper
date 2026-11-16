@@ -10,11 +10,16 @@ const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 const LOCK_NAME = '.oauth_refresh.lock'
 const LOCK_STALE_MS = 60_000
 const MINUTE = 60_000
+const FETCH_TIMEOUT_MS = 30_000
+// Temp file created exclusively (noclobber, after removing any leftover or planted one) with mode 0600, then
+// renamed over the original; removed if anything fails. The tokens arrive on stdin, never in argv.
+const SAVE_SCRIPT = 'umask 077; rm -f "$1"; set -C; cat > "$1" && mv -f "$1" "$2" || { rm -f "$1"; exit 1; }'
 
 // Identifies this loaded module in the lease file; a /clear keeps the process, and so the lease.
 const HOLDER = crypto.randomUUID()
 
 type Credentials = { claudeAiOauth: Record<string, any>; [key: string]: unknown }
+type Read = { creds: Credentials; mtimeMs: number; isLink: boolean }
 type AccountState = { lastRefreshAt?: number; lastError?: string; needsLoginMtime?: number; toasted?: boolean }
 // $ may only be handed to functions declared at the top of this file, so what the hooks share lives here.
 type Ctx = {
@@ -32,14 +37,27 @@ function stateOf(c: Ctx, dir: string): AccountState {
   return s
 }
 
-async function readCreds($: Dollar, file: string): Promise<{ creds: Credentials; mtimeMs: number } | undefined> {
+async function readCreds($: Dollar, file: string): Promise<Read | undefined> {
   try {
     const creds = JSON.parse(await $.fs.read(file))
-    const { mtimeMs } = await $.fs.stat(file)
-    return creds?.claudeAiOauth ? { creds, mtimeMs } : undefined
+    const { mtimeMs, isLink } = await $.fs.stat(file)
+    return creds?.claudeAiOauth ? { creds, mtimeMs, isLink } : undefined
   } catch {
     return undefined
   }
+}
+
+// Why an account cannot be refreshed: a symlinked file is never rewritten, and an empty refresh token has nothing to send.
+function problem(read: Read): string | undefined {
+  if (read.isLink) return 'skipped (credentials file is a symlink)'
+  const token = read.creds.claudeAiOauth.refreshToken
+  if (typeof token !== 'string' || !token) return 'skipped (no refresh token)'
+}
+
+// First 8 bytes of SHA-256, hex: names a lease file and spots copies of one login; never shown or stored.
+async function sha(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return [...new Uint8Array(digest).slice(0, 8)].map((b) => b.toString(16).padStart(2, '0')).join('')
 }
 
 async function resolveAccounts($: Dollar, c: Ctx): Promise<string[]> {
@@ -57,51 +75,77 @@ async function resolveAccounts($: Dollar, c: Ctx): Promise<string[]> {
   return dirs
 }
 
-async function leaseFile($: Dollar): Promise<string> {
+// One lease file per set of accounts, so sessions that look after different accounts do not block each other.
+async function leaseFile($: Dollar, dirs: string[]): Promise<string> {
   const home = (await $.env.get('HOME')) ?? ''
-  return `${(await $.env.get('XDG_STATE_HOME')) || `${home}/.local/state`}/claude-token-keeper/lease.json`
+  const base = (await $.env.get('XDG_STATE_HOME')) || `${home}/.local/state`
+  return `${base}/claude-token-keeper/lease-${await sha([...dirs].sort().join('\n'))}.json`
 }
 
 // Only one open session refreshes at a time. Two sessions can both take an expired lease in the same
 // instant; the per-account lock and the re-read under it still keep that to one request.
-async function holdsLease($: Dollar, c: Ctx, now: number): Promise<boolean> {
-  const file = await leaseFile($)
+async function holdsLease($: Dollar, c: Ctx, dirs: string[], now: number): Promise<boolean> {
+  const file = await leaseFile($, dirs)
   const lease = await $.fs.read(file).then(JSON.parse, () => undefined)
   if (lease && lease.holder !== HOLDER && lease.until > now) return false
   await $.fs.write(file, JSON.stringify({ holder: HOLDER, until: now + 2 * c.checkEvery }))
   return true
 }
 
-async function releaseLease($: Dollar) {
-  const file = await leaseFile($)
+async function releaseLease($: Dollar, c: Ctx) {
+  const file = await leaseFile($, await resolveAccounts($, c))
   const lease = await $.fs.read(file).then(JSON.parse, () => undefined)
   if (lease?.holder === HOLDER) await $.fs.write(file, JSON.stringify({ holder: HOLDER, until: 0 }))
 }
 
-async function takeLock($: Dollar, lock: string, now: number): Promise<boolean> {
+// Returns the lock directory's mtime as we created it (so release can tell it is still ours), or undefined.
+async function takeLock($: Dollar, lock: string, now: number): Promise<number | undefined> {
   for (let attempt = 0; attempt < 2; attempt++) {
-    if ((await $.process.run(['mkdir', lock])).exitCode === 0) return true
+    if ((await $.process.run(['mkdir', lock])).exitCode === 0) return $.fs.stat(lock).then((s) => s.mtimeMs, () => -1)
     const age = await $.fs.stat(lock).then((s) => now - s.mtimeMs, () => 0)
-    if (age < LOCK_STALE_MS) return false
-    await $.process.run(['rmdir', lock])
+    if (age < LOCK_STALE_MS) return undefined
+    // Rename before deleting so two breakers never delete the same directory. A lock that went live again
+    // between the check and the rename can still be broken (a window of microseconds, accepted).
+    const aside = `${lock}.stale-${crypto.randomUUID()}`
+    await $.process.run(['mv', lock, aside])
+    await $.process.run(['rmdir', aside])
   }
-  return false
+  return undefined
 }
 
-// Temp file with mode 0600, then rename over the original; the tokens travel on stdin, never in argv.
+// Release only a lock that is still the one we created: after a stall past the stale limit it may be someone else's.
+async function releaseLock($: Dollar, lock: string, mtimeMs: number) {
+  const now = await $.fs.stat(lock).then((s) => s.mtimeMs, () => undefined)
+  if (now === mtimeMs) await $.process.run(['rmdir', lock]).catch(() => undefined)
+}
+
 async function save($: Dollar, file: string, text: string): Promise<boolean> {
   for (let attempt = 0; attempt < 3; attempt++) {
-    const run = await $.process
-      .run(['sh', '-c', 'umask 077 && cat > "$1" && mv -f "$1" "$2"', 'sh', `${file}.tk-tmp`, file], { stdin: text })
-      .catch(() => undefined)
+    const run = await $.process.run(['sh', '-c', SAVE_SCRIPT, 'sh', `${file}.tk-tmp`, file], { stdin: text }).catch(() => undefined)
     if (run?.exitCode === 0) return true
   }
   return false
 }
 
+// The token endpoint, raced against a timer so a hung request cannot hold the lock or the tick forever.
+async function requestToken($: Dollar, body: Record<string, string>) {
+  let timer: { cancel: () => void } | undefined
+  const timeout = new Promise<undefined>((resolve) => {
+    timer = $.clock.after(FETCH_TIMEOUT_MS, () => resolve(undefined))
+  })
+  try {
+    return await Promise.race([
+      $.http.fetch(TOKEN_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).catch(() => undefined),
+      timeout,
+    ])
+  } finally {
+    timer?.cancel()
+  }
+}
+
 const isDue = (c: Ctx, oauth: Record<string, any>, now: number, force: boolean) => force || now >= oauth.expiresAt - c.refreshBefore
 
-async function refresh($: Dollar, c: Ctx, dir: string, force: boolean) {
+async function refresh($: Dollar, c: Ctx, dir: string, force: boolean, seen: Map<string, string>) {
   const state = stateOf(c, dir)
   const file = `${dir}/.credentials.json`
   const lock = `${dir}/${LOCK_NAME}`
@@ -110,35 +154,49 @@ async function refresh($: Dollar, c: Ctx, dir: string, force: boolean) {
     state.lastError = 'skipped (no credentials file)'
     return
   }
+  const bad = problem(first)
+  if (bad) {
+    state.lastError = bad
+    return
+  }
+  // Copies of one login (a copied config dir) would each spend the same refresh token: handle it once per tick.
+  const hash = await sha(first.creds.claudeAiOauth.refreshToken)
+  const twin = seen.get(hash)
+  if (twin) {
+    state.lastError = `same login as ${twin}`
+    return
+  }
+  seen.set(hash, dir)
   if (!force && first.mtimeMs === state.needsLoginMtime) return
   if (!isDue(c, first.creds.claudeAiOauth, await $.clock.now(), force)) return
-  if (!(await takeLock($, lock, await $.clock.now()))) {
+  const mine = await takeLock($, lock, await $.clock.now())
+  if (mine === undefined) {
     state.lastError = 'another process is refreshing'
     return
   }
   try {
     // Claude Code (or another session) may have refreshed while we waited for the lock.
     const current = await readCreds($, file)
-    if (!current || !isDue(c, current.creds.claudeAiOauth, await $.clock.now(), force)) return
+    if (!current || problem(current) || !isDue(c, current.creds.claudeAiOauth, await $.clock.now(), force)) return
     const old = current.creds.claudeAiOauth
 
-    let res
-    try {
-      res = await $.http.fetch(TOKEN_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          grant_type: 'refresh_token',
-          refresh_token: old.refreshToken,
-          client_id: old.clientId ?? CLIENT_ID,
-          scope: (old.scopes ?? []).join(' '),
-        }),
-      })
-    } catch {
+    const res = await requestToken($, {
+      grant_type: 'refresh_token',
+      refresh_token: old.refreshToken,
+      client_id: old.clientId ?? CLIENT_ID,
+      ...(old.scopes?.length ? { scope: old.scopes.join(' ') } : {}),
+    })
+    if (!res) {
       state.lastError = 'network error'
       return
     }
-    if (res.status === 400 || res.status === 401) {
+    let data: any
+    try {
+      data = JSON.parse(res.text)
+    } catch {
+      // Falls through to the status or "unexpected response".
+    }
+    if ((res.status === 400 || res.status === 401) && data?.error === 'invalid_grant') {
       state.lastError = 'needs login'
       state.needsLoginMtime = current.mtimeMs
       if (!state.toasted) {
@@ -147,20 +205,20 @@ async function refresh($: Dollar, c: Ctx, dir: string, force: boolean) {
       }
       return
     }
-    let data: any
-    try {
-      data = res.ok ? JSON.parse(res.text) : undefined
-    } catch {
-      // Falls through to "unexpected response".
-    }
-    if (typeof data?.access_token !== 'string' || typeof data?.expires_in !== 'number') {
+    if (!res.ok || typeof data?.access_token !== 'string' || typeof data?.expires_in !== 'number') {
       state.lastError = res.ok ? 'unexpected response' : `http ${res.status}`
       return
     }
 
+    // Something may have written the file while the request was out: never overwrite a login we did not read.
+    const latest = await readCreds($, file)
+    if (!latest || problem(latest) || latest.creds.claudeAiOauth.refreshToken !== old.refreshToken) {
+      state.lastError = 'credentials changed during the refresh; not saved'
+      return
+    }
     const now = await $.clock.now()
     const oauth: Record<string, any> = {
-      ...old,
+      ...latest.creds.claudeAiOauth,
       accessToken: data.access_token,
       refreshToken: typeof data.refresh_token === 'string' ? data.refresh_token : old.refreshToken,
       expiresAt: now + data.expires_in * 1000,
@@ -168,7 +226,7 @@ async function refresh($: Dollar, c: Ctx, dir: string, force: boolean) {
     if (typeof data.refresh_token_expires_in === 'number') oauth.refreshTokenExpiresAt = now + data.refresh_token_expires_in * 1000
     if (typeof data.scope === 'string' && data.scope) oauth.scopes = data.scope.split(' ').filter(Boolean)
 
-    if (await save($, file, JSON.stringify({ ...current.creds, claudeAiOauth: oauth }))) {
+    if (await save($, file, JSON.stringify({ ...latest.creds, claudeAiOauth: oauth }))) {
       state.lastRefreshAt = now
       state.lastError = undefined
       state.needsLoginMtime = undefined
@@ -180,15 +238,17 @@ async function refresh($: Dollar, c: Ctx, dir: string, force: boolean) {
       })
     }
   } finally {
-    await $.process.run(['rmdir', lock]).catch(() => undefined)
+    await releaseLock($, lock, mine)
   }
 }
 
 async function tick($: Dollar, c: Ctx, force: boolean) {
-  if (!force && !(await holdsLease($, c, await $.clock.now()))) return
-  for (const dir of await resolveAccounts($, c)) {
+  const dirs = await resolveAccounts($, c)
+  if (!force && !(await holdsLease($, c, dirs, await $.clock.now()))) return
+  const seen = new Map<string, string>()
+  for (const dir of dirs) {
     try {
-      await refresh($, c, dir, force)
+      await refresh($, c, dir, force, seen)
     } catch {
       stateOf(c, dir).lastError = 'unexpected error'
     }
@@ -265,7 +325,7 @@ export const register: Register = (on, options) => {
     if (e.reason !== 'clear') {
       c.timer?.cancel()
       c.timer = undefined
-      await releaseLease($).catch(() => undefined)
+      await releaseLease($, c).catch(() => undefined)
     }
     return next(e)
   })
