@@ -27,6 +27,7 @@ type Ctx = {
   checkEvery: number
   refreshBefore: number
   states: Map<string, AccountState>
+  rotated: Map<string, string> // hashes of refresh tokens this mod rotated away, and the dir each came from
   ticking: boolean
   timer?: { cancel: () => void }
 }
@@ -101,7 +102,12 @@ async function releaseLease($: Dollar, c: Ctx) {
 // Returns the lock directory's mtime as we created it (so release can tell it is still ours), or undefined.
 async function takeLock($: Dollar, lock: string, now: number): Promise<number | undefined> {
   for (let attempt = 0; attempt < 2; attempt++) {
-    if ((await $.process.run(['mkdir', lock])).exitCode === 0) return $.fs.stat(lock).then((s) => s.mtimeMs, () => -1)
+    if ((await $.process.run(['mkdir', lock])).exitCode === 0) {
+      const mtimeMs = await $.fs.stat(lock).then((s) => s.mtimeMs, () => undefined)
+      if (mtimeMs !== undefined) return mtimeMs
+      await $.process.run(['rmdir', lock]) // cannot tell later whether it is still ours: do not hold it
+      return undefined
+    }
     const age = await $.fs.stat(lock).then((s) => now - s.mtimeMs, () => 0)
     if (age < LOCK_STALE_MS) return undefined
     // Rename before deleting so two breakers never delete the same directory. A lock that went live again
@@ -167,6 +173,11 @@ async function refresh($: Dollar, c: Ctx, dir: string, force: boolean, seen: Map
     return
   }
   seen.set(hash, dir)
+  const rotatedFrom = c.rotated.get(hash)
+  if (rotatedFrom) {
+    state.lastError = `stale copy of ${rotatedFrom}` // its refresh token was rotated away: the server would refuse it
+    return
+  }
   if (!force && first.mtimeMs === state.needsLoginMtime) return
   if (!isDue(c, first.creds.claudeAiOauth, await $.clock.now(), force)) return
   const mine = await takeLock($, lock, await $.clock.now())
@@ -196,7 +207,8 @@ async function refresh($: Dollar, c: Ctx, dir: string, force: boolean, seen: Map
     } catch {
       // Falls through to the status or "unexpected response".
     }
-    if ((res.status === 400 || res.status === 401) && data?.error === 'invalid_grant') {
+    const code = typeof data?.error === 'string' ? data.error : data?.error?.type
+    if ((res.status === 400 || res.status === 401) && code === 'invalid_grant') {
       state.lastError = 'needs login'
       state.needsLoginMtime = current.mtimeMs
       if (!state.toasted) {
@@ -228,6 +240,7 @@ async function refresh($: Dollar, c: Ctx, dir: string, force: boolean, seen: Map
 
     if (await save($, file, JSON.stringify({ ...latest.creds, claudeAiOauth: oauth }))) {
       state.lastRefreshAt = now
+      if (oauth.refreshToken !== old.refreshToken) c.rotated.set(await sha(old.refreshToken), dir)
       state.lastError = undefined
       state.needsLoginMtime = undefined
     } else {
@@ -301,6 +314,7 @@ export const register: Register = (on, options) => {
     checkEvery: Math.max(1, Number(options.checkEveryMinutes ?? 10)) * MINUTE,
     refreshBefore: Math.max(1, Number(options.refreshBeforeMinutes ?? 30)) * MINUTE,
     states: new Map(),
+    rotated: new Map(),
     ticking: false,
   }
 

@@ -53,6 +53,7 @@ function world(on: any, clock: { now: () => number }, init: { files?: Record<str
     reply: (init.reply ?? (() => okReply())) as () => unknown,
     failSave: false,
     links: new Set<string>(),
+    hideLockStat: false,
     onLock: undefined as undefined | ((dir: string) => void),
     put(path: string, text: string) {
       files.set(path, { text, mtimeMs: clock.now() })
@@ -68,6 +69,7 @@ function world(on: any, clock: { now: () => number }, init: { files?: Record<str
     return { value: undefined }
   })
   on('fs.stat', ($: any, e: any) => {
+    if (w.hideLockStat && e.path.endsWith('.oauth_refresh.lock')) return { deny: 'ENOENT' }
     const f = files.get(e.path)
     if (f) return { value: { kind: 'file', size: f.text.length, mtimeMs: f.mtimeMs, isLink: w.links.has(e.path) } }
     if (dirs.has(e.path)) return { value: { kind: 'dir', size: 0, mtimeMs: dirs.get(e.path), isLink: false } }
@@ -229,7 +231,7 @@ test('a lock held by another process blocks, a stale one is taken, a refresh tha
   expect(w.argvs[moved + 1]).toEqual(['rmdir', w.argvs[moved]![2]]) // ... then that name is deleted, never the lock path itself
 
   // Someone else lands a fresh token between our first read and the lock.
-  w.put(CRED, creds(T0 + 5 * MIN))
+  w.put(CRED, creds(T0 + 5 * MIN, { refreshToken: 'RT-second' }))
   w.onLock = () => w.put(CRED, creds(clock.now() + 8 * 60 * MIN, { accessToken: 'AT-new-secret' }))
   await clock.advance(10 * MIN)
   expect(w.requests.length).toBe(1)
@@ -578,4 +580,52 @@ test('the lease belongs to a set of accounts: a lease held for another set does 
   expect(w.requests.length).toBe(1) // the other set's lease is not ours to wait for
   expect(w.text(other)).toBe(held)
   expect(JSON.parse(w.text(own)!).holder).not.toBe('another-session')
+})
+
+test('invalid_grant is read from both answer shapes', async ($, on) => {
+  const clock = mock.clock(on, { now: T0 })
+  mock.env(on, { HOME })
+  const w = world(on, clock, {
+    files: { [CRED]: creds(T0 + 5 * MIN) },
+    reply: () => ({ status: 400, ok: false, headers: {}, text: '{"error":{"type":"invalid_grant","message":"x"}}' }),
+  })
+
+  await start($)
+  await clock.settle()
+  expect(w.toasts.length).toBe(1)
+  expect(await status($)).toContain('last error needs login')
+})
+
+test('a copy still holding a refresh token the mod rotated away is skipped without a request', async ($, on) => {
+  const clock = mock.clock(on, { now: T0 })
+  mock.env(on, { HOME })
+  const copy = `${HOME}/.claude-copy/.credentials.json`
+  const w = world(on, clock, {
+    files: { [CRED]: creds(T0 + 5 * MIN), [copy]: creds(T0 + 5 * MIN) },
+    entries: [{ name: '.claude-copy', kind: 'dir' }],
+  })
+
+  await start($)
+  await clock.settle()
+  expect(w.requests.length).toBe(1) // the copy shared the token: handled once
+  expect(w.oauth(CRED).refreshToken).toBe('RT-new-secret')
+
+  await clock.advance(10 * MIN) // the original is fresh; the copy still holds the dead token
+  expect(w.requests.length).toBe(1)
+  expect(w.text(copy)).toBe(creds(T0 + 5 * MIN))
+  expect(await status($)).toContain(`last error stale copy of ${HOME}/.claude`)
+  expect(w.toasts.length).toBe(0)
+})
+
+test('if the lock cannot be examined right after it is created, it is not held', async ($, on) => {
+  const clock = mock.clock(on, { now: T0 })
+  mock.env(on, { HOME })
+  const w = world(on, clock, { files: { [CRED]: creds(T0 + 5 * MIN) } })
+  w.hideLockStat = true
+
+  await start($)
+  await clock.settle()
+  expect(w.requests.length).toBe(0)
+  expect(w.dirs.has(LOCK)).toBe(false)
+  expect(await status($)).toContain('last error another process is refreshing')
 })

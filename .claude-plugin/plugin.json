@@ -1,6 +1,6 @@
 {
   "name": "token-keeper",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "While any Claude Code session is open, keeps the OAuth login of one or more Claude config dirs fresh, so a rarely used account is not logged out.",
   "author": {
     "name": "Leonardo de Mattos"
