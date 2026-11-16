@@ -1,0 +1,14 @@
+{
+  "name": "claude-token-keeper",
+  "owner": {
+    "name": "Leonardo de Mattos"
+  },
+  "plugins": [
+    {
+      "name": "token-keeper",
+      "source": "./",
+      "description": "Keeps the OAuth login of your Claude config dirs fresh while any Claude Code session is open."
+    }
+  ],
+  "description": "Keeps the OAuth login of your Claude config dirs fresh while any Claude Code session is open."
+}

@@ -1,0 +1,32 @@
+{
+  "name": "token-keeper",
+  "version": "0.1.0",
+  "description": "While any Claude Code session is open, keeps the OAuth login of one or more Claude config dirs fresh, so a rarely used account is not logged out.",
+  "author": {
+    "name": "Leonardo de Mattos"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/leomattos7/claude-token-keeper",
+  "userConfig": {
+    "accounts": {
+      "type": "string",
+      "title": "Accounts",
+      "description": "auto = ~/.claude plus every ~/.claude-* dir with a login; current = this session's own config dir only; or a comma-separated list of config dirs (~ allowed).",
+      "default": "auto"
+    },
+    "checkEveryMinutes": {
+      "type": "number",
+      "title": "Check every (minutes)",
+      "description": "How often the open sessions check the logins.",
+      "default": 10,
+      "min": 1
+    },
+    "refreshBeforeMinutes": {
+      "type": "number",
+      "title": "Refresh before expiry (minutes)",
+      "description": "Refresh an account when its access token expires within this window (or already expired). A fresher token is never rotated.",
+      "default": 30,
+      "min": 1
+    }
+  }
+}
